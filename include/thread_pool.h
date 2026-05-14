@@ -3,7 +3,7 @@
 #include<mutex>
 #include<condition_variable>
 #include<vector>
-#include"SafeQueue.h"
+#include"safe_queue.h"
 #include<thread>
 #include<utility>
 #include<future>

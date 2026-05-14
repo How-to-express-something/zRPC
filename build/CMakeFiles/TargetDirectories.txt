@@ -1,3 +1,0 @@
-/home/yzyz/projects/RPCServer/build/CMakeFiles/RPCServer.dir
-/home/yzyz/projects/RPCServer/build/CMakeFiles/edit_cache.dir
-/home/yzyz/projects/RPCServer/build/CMakeFiles/rebuild_cache.dir
