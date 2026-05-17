@@ -40,12 +40,16 @@ include_directories(
 
 # 源文件
 set(SOURCE_FILES
+    coder.cpp
+    serialzation.cpp
     log.cpp
     main.cpp
     protocol.cpp
     safe_queue.cpp
     thread_pool.cpp
     rpcserver.cpp
+    person.pb.cc
+    compresser.cpp
 )
 
 # 创建可执行文件
