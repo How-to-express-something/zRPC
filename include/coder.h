@@ -6,7 +6,6 @@
 #include "protocol.h"
 
 
-
 struct CodecOptions {
     std::string aes_key;                      // AES 密钥（支持 128/192/256 bit）
     std::string aes_iv;                       // AES 初始化向量
@@ -30,6 +29,6 @@ bool EncodeResponse(const RpcResponse& response, const CodecOptions& options, st
 
 
 // 解码并校验帧，输出结构化结果   自动识别请求/响应/心跳并解析对应内容（所以要返回结构体）
-bool DecodeFrame(std::string_view frame, const CodecOptions& options, DecodedFrame& decoded, std::string* error);
+bool VerifyAndDecodeFrame(FrameHeader& header, const std::string& body, DecodedFrame& decoded, const CodecOptions& options, std::string* error);
 
 

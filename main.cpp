@@ -1,69 +1,98 @@
-// main.cpp
+#include "coder.h"
+#include "protocol.h"
+#include <cassert>
 #include <iostream>
-#include "person.pb.h"      // 生成的 protobuf 消息类
-#include "serialzation.h"   // 你的序列化框架
+
+// ==================== 桩函数（后续替换为实际实现） ====================
+
+
+
+// EncodeHeader 和 DecodeHeader 已在 protocol 中实现，这里无需提供桩
 
 int main() {
-    // ---- 构造一条消息 ----
-    Person original;
-    original.set_name("Alice");
-    original.set_age(30);
-    original.add_emails("alice@example.com");
-    original.add_emails("alice@work.org");
+    // 1. 构造 RPC 请求
+    RpcRequest req;
+    req.request_id = 123456789;
+    req.service = "Calculator";
+    req.method = "Add";
+    req.route_key = "user_42";
+    req.payload = "protobuf_binary_data";
+    req.timeout_ms = 5000;
+    req.serialization = SerializationType::Protobuf;
+    req.compression = CompressionType::None;
+    req.encryption = EncryptionType::None;
 
-    // ---- 测试 Protobuf 二进制序列化 ----
-    std::string bin_out;
+    // 2. 编码请求
+    CodecOptions options;
+    std::string frame;
     std::string error;
-    bool ok = SerializeMessage(original, SerializationType::Protobuf, bin_out, &error);
-    if (!ok) {
-        std::cerr << "Binary serialize failed: " << error << std::endl;
+    bool ok = EncodeRequest(req, options, frame, &error);
+    assert(ok && "EncodeRequest failed");
+    std::cout << "✓ EncodeRequest succeeded, frame size = " << frame.size() << std::endl;
+
+    // 3. 用 DecodeHeader 解析头部，得到 body
+    if (frame.size() < FrameHeader::header_size) {
+        std::cerr << "Frame too small" << std::endl;
         return 1;
     }
-    std::cout << "Binary serialized (" << bin_out.size() << " bytes)" << std::endl;
-
-    // Protobuf 反序列化
-    Person restored_from_bin;
-    ok = DeserializeMessage(bin_out, SerializationType::Protobuf, restored_from_bin, &error);
-    if (!ok) {
-        std::cerr << "Binary deserialize failed: " << error << std::endl;
+    FrameHeader header;
+    std::string header_part = frame.substr(0, FrameHeader::header_size);
+    if (!DecodeHeader(header_part, header)) {
+        std::cerr << "DecodeHeader failed" << std::endl;
         return 1;
     }
-    std::cout << "From binary -> name: " << restored_from_bin.name()
-              << ", age: " << restored_from_bin.age()
-              << ", emails count: " << restored_from_bin.emails_size() << std::endl;
+    std::string body = frame.substr(FrameHeader::header_size);
 
-    // ---- 测试 JSON 序列化 ----
-    std::string json_out;
-    ok = SerializeMessage(original, SerializationType::Json, json_out, &error);
-    if (!ok) {
-        std::cerr << "JSON serialize failed: " << error << std::endl;
+    // 4. 解码并校验帧
+    DecodedFrame decoded;
+    std::string decode_error;
+    ok = VerifyAndDecodeFrame(header, body, decoded, options, &decode_error);
+    std::cerr << "Decode error (if any): " << decode_error << std::endl;
+    assert(ok && "VerifyAndDecodeFrame failed");
+    std::cout << "✓ Decode succeeded, type = " << static_cast<int>(decoded.type) << std::endl;
+
+    // 5. 验证请求字段
+    assert(decoded.type == MessageType::Request);
+    assert(decoded.request.request_id == req.request_id);
+    assert(decoded.request.service == req.service);
+    assert(decoded.request.method == req.method);
+    assert(decoded.request.route_key == req.route_key);
+    assert(decoded.request.payload == req.payload);
+    assert(decoded.request.serialization == req.serialization);
+    assert(decoded.request.compression == req.compression);
+    assert(decoded.request.encryption == req.encryption);
+    std::cout << "✓ All request fields match" << std::endl;
+
+    // 6. 测试响应编解码
+    RpcResponse resp;
+    resp.request_id = 123456789;
+    resp.status_code = 0;
+    resp.error_message = "";
+    resp.payload = "result_data";
+    resp.serialization = SerializationType::Protobuf;
+    resp.compression = CompressionType::None;
+    resp.encryption = EncryptionType::None;
+
+    ok = EncodeResponse(resp, options, frame, &error);
+    assert(ok && "EncodeResponse failed");
+    std::cout << "✓ EncodeResponse succeeded, frame size = " << frame.size() << std::endl;
+
+    header_part = frame.substr(0, FrameHeader::header_size);
+    if (!DecodeHeader(header_part, header)) {
+        std::cerr << "DecodeHeader failed for response" << std::endl;
         return 1;
     }
-    std::cout << "\nJSON serialized:\n" << json_out << std::endl;
+    body = frame.substr(FrameHeader::header_size);
 
-    // JSON 反序列化
-    Person restored_from_json;
-    ok = DeserializeMessage(json_out, SerializationType::Json, restored_from_json, &error);
-    if (!ok) {
-        std::cerr << "JSON deserialize failed: " << error << std::endl;
-        return 1;
-    }
-    std::cout << "From JSON -> name: " << restored_from_json.name()
-              << ", age: " << restored_from_json.age()
-              << ", emails count: " << restored_from_json.emails_size() << std::endl;
+    DecodedFrame decoded_resp;
+    ok = VerifyAndDecodeFrame(header, body, decoded_resp, options, &decode_error);
+    assert(ok && "Decode response failed");
+    assert(decoded_resp.type == MessageType::Response);
+    assert(decoded_resp.response.request_id == resp.request_id);
+    assert(decoded_resp.response.status_code == resp.status_code);
+    assert(decoded_resp.response.payload == resp.payload);
+    std::cout << "✓ All response fields match" << std::endl;
 
-    // ---- 验证数据一致性 ----
-    if (original.name() == restored_from_bin.name() &&
-        original.age() == restored_from_bin.age() &&
-        original.emails_size() == restored_from_bin.emails_size() &&
-        original.name() == restored_from_json.name() &&
-        original.age() == restored_from_json.age() &&
-        original.emails_size() == restored_from_json.emails_size()) {
-        std::cout << "\nAll tests passed!" << std::endl;
-    } else {
-        std::cerr << "\nTest failed: data mismatch." << std::endl;
-        return 1;
-    }
-
+    std::cout << "\n🎉 All tests passed!" << std::endl;
     return 0;
 }

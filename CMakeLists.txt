@@ -31,11 +31,29 @@ pkg_check_modules(LIBEVENT_PTHREADS REQUIRED libevent_pthreads)
 find_package(Protobuf REQUIRED CONFIG)
 message(STATUS "Found Protobuf: ${Protobuf_VERSION}")
 
+find_package(ZLIB REQUIRED)
+message(STATUS "Found ZLIB: ${ZLIB_VERSION}")
+
+# ===== 新增 1：查找 OpenSSL（必需） =====
+find_package(OpenSSL REQUIRED)
+message(STATUS "Found OpenSSL: ${OPENSSL_VERSION}")
+
+# ===== 新增 2：可选查找 zstd，如果找到则定义 HAS_ZSTD 宏 =====
+find_package(zstd QUIET CONFIG)   # 优先用 CONFIG 模式寻找官方 zstdConfig.cmake
+if(NOT zstd_FOUND)
+    # 如果没找到，尝试用 pkg-config 再找一次（很多发行版会提供 .pc 文件）
+    pkg_check_modules(zstd IMPORTED_TARGET libzstd)
+endif()
+if(zstd_FOUND)
+    message(STATUS "Found zstd: enabling HAS_ZSTD")
+else()
+    message(STATUS "zstd not found - compression support disabled")
+endif()
+
 # 包含头文件目录
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${LIBEVENT_INCLUDE_DIRS}
-    # 使用现代目标后，Protobuf 的头文件路径会自动添加，这里可以省略
 )
 
 # 源文件
@@ -50,6 +68,7 @@ set(SOURCE_FILES
     rpcserver.cpp
     person.pb.cc
     compresser.cpp
+    crypto.cpp
 )
 
 # 创建可执行文件
@@ -57,17 +76,37 @@ add_executable(RPCServer ${SOURCE_FILES})
 
 # ========== 关键修改 4：用目标方式链接，自动传递所有依赖 ==========
 target_link_libraries(RPCServer
-    protobuf::libprotobuf        # 代替 ${Protobuf_LIBRARIES}，它会带上 Abseil 等依赖
+    protobuf::libprotobuf
     ${LIBEVENT_LIBRARIES}
     ${LIBEVENT_PTHREADS_LIBRARIES}
-    # 额外补充几个常用的 Abseil 组件（防止某些符号找不到）
     absl::strings
     absl::any
     absl::log
     absl::hash
     absl::status
+    ZLIB::ZLIB
+    # ===== 新增：OpenSSL 链接 =====
+    OpenSSL::SSL
+    OpenSSL::Crypto
     pthread
 )
+
+# ===== 新增 3：若找到 zstd，链接库并定义宏 =====
+if(zstd_FOUND)
+    # 如果通过 pkg_check_modules(IMPORTED_TARGET) 获得目标，名为 PkgConfig::zstd
+    # 如果通过 find_package(zstd CONFIG) 获得目标，通常为 zstd::libzstd
+    # 为了兼容两种方式，先判断是否存在目标
+    if(TARGET PkgConfig::zstd)
+        target_link_libraries(RPCServer PkgConfig::zstd)
+    elseif(TARGET zstd::libzstd)
+        target_link_libraries(RPCServer zstd::libzstd)
+    else()
+        # 如果只有变量，用传统方式（可能性很低）
+        target_link_libraries(RPCServer ${zstd_LIBRARIES})
+        target_include_directories(RPCServer PRIVATE ${zstd_INCLUDE_DIRS})
+    endif()
+    target_compile_definitions(RPCServer PRIVATE HAS_ZSTD)
+endif()
 
 # 设置输出目录
 set_target_properties(RPCServer PROPERTIES
