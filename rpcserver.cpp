@@ -1,6 +1,6 @@
 #include"rpcserver.h"   
 
-void MainReactor::listener_callback(struct evconnlistener *listener, evutil_socket_t fd, struct sockaddr *addr, int socklen, void *arg)
+void MainReactor::listener_callback(struct evconnlistener * /*listener*/, evutil_socket_t fd, struct sockaddr * /*addr*/, int /*socklen*/, void *arg)
 {   
 
     static int next_worker = 0;

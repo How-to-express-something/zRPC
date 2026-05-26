@@ -1,20 +1,14 @@
-﻿#pragma once
-#include<functional>
-#include<mutex>
-#include<condition_variable>
-#include<vector>
-#include"safe_queue.h"
-#include<thread>
-#include<utility>
-#include<future>
-//====================================================================
-//              等待队列
-//                 |
-//原有线程 ---   线程池（空时同时）--- 临时线程（临时产生销毁）
-
-//等待队列：线程安全的队列
-
-
+#pragma once
+#include <functional>
+#include <mutex>
+#include <condition_variable>
+#include <vector>
+#include <thread>
+#include <utility>
+#include <future>
+#include <chrono>
+#include "safe_queue.h"
+#include "metrics.h"
 
 class ThreadPool
 {
@@ -51,12 +45,6 @@ public:
 	ThreadPool(const int& num = 4) :thread_pool(std::vector<std::thread>(num)) {};
 
 	ThreadPool(const ThreadPool&) = delete;
-	//​
-	//ThreadPool(ThreadPool&&) = delete;
-	//​
-	//ThreadPool& operator=(const ThreadPool&) = delete;
-	//​
-	//ThreadPool& operator=(ThreadPool&&) = delete;
 
 	void init();
 	void shutdown();
@@ -64,16 +52,26 @@ public:
 	template<typename F,typename ...Args>
 	auto submit(F&& f, Args&&...args) -> std::future<decltype(f(args...))>
 	{
+		MetricsCollector::Instance().RecordQueueDepth(task_queue.Size());
 
-		//统一为function<T()>;
-		std::function<decltype(f(args...))()> func = std::bind(std::forward<F>(f), std::forward<Args>(args)...); //完美转发 保持原来的引用
+		std::function<decltype(f(args...))()> func = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
 
-		//统一为function<void()> 通过task无需理会返回值实现
 		auto task = std::make_shared<std::packaged_task<decltype(f(args...))()>>(func);
 
-		auto wrap_task = [task]() {
+		auto enqueue_time = std::chrono::steady_clock::now();
+		auto wrap_task = [task, enqueue_time]() {
+			auto dequeue_time = std::chrono::steady_clock::now();
+			int64_t wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
+				dequeue_time - enqueue_time).count();
+			MetricsCollector::Instance().RecordTaskWaitUs(wait_us);
+
 			(*task)();
-			};
+
+			auto done_time = std::chrono::steady_clock::now();
+			int64_t exec_us = std::chrono::duration_cast<std::chrono::microseconds>(
+				done_time - dequeue_time).count();
+			MetricsCollector::Instance().RecordTaskExecUs(exec_us);
+		};
 
 		task_queue.Push(wrap_task);
 		queue_cv.notify_one();
@@ -89,5 +87,3 @@ private:
 
 
 };
-
-

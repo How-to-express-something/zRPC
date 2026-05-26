@@ -1,10 +1,5 @@
 #pragma once
 
-/*
-RpcSession生命周期还未处理
-
-*/
-
 #include <arpa/inet.h>
 #include <functional>
 #include <google/protobuf/message.h>
@@ -20,8 +15,11 @@ RpcSession生命周期还未处理
 #include <queue>
 #include <unistd.h>
 #include <memory>
-#include <iostream>
+#include <chrono>
 #include "coder.h"
+#include "serialzation.h"
+#include "log.h"
+#include "metrics.h"
 
 
 using Handler = std::function<bool(const RpcRequest& request, RpcResponse& response,std::string* error)>;
@@ -62,7 +60,8 @@ class WorkerReactor
     class RpcSession : public std::enable_shared_from_this<RpcSession> {
         friend class WorkerReactor;
         public:
-            RpcSession(struct bufferevent* bev) : bev_(bev) {}
+            RpcSession(struct bufferevent* bev, ThreadPool* pool, SafeHandlerMap* handlers)
+                : thread_pool_(pool), handlers_(handlers), bev_(bev) {}
 
     // 可以从任意线程调用，将响应数据投递到事件循环发送
          void SendResponse(const std::string& serialized_response) {
@@ -92,6 +91,9 @@ class WorkerReactor
         }
     }
 
+    ThreadPool* thread_pool_;
+    SafeHandlerMap* handlers_;
+
 private:
     bufferevent* bev_;
     event* send_ev_;  // 在事件循环线程初始化
@@ -106,28 +108,19 @@ private:
     std::mutex mutex;
     std::queue<evutil_socket_t>  pending_fd;
     int notify_pipe[2];
-    static ThreadPool* thread_pool; //
-    static SafeHandlerMap* handlers_;
+    ThreadPool* thread_pool_ = nullptr;
+    SafeHandlerMap* handlers_ = nullptr;
     event* notify_event;
 
 public:
 
-    WorkerReactor(struct event_base* base, int id):base(base),id_(id)
+    WorkerReactor(struct event_base* base, ThreadPool* pool, SafeHandlerMap* handlers, int id)
+        : id_(id), base(base), thread_pool_(pool), handlers_(handlers)
     {
         pipe(notify_pipe);
         notify_event = event_new(base, notify_pipe[0], EV_READ | EV_PERSIST, notify_callback, this);
         event_add(notify_event, nullptr);
-       std::cout << "WorkerReactor " << id_ << " initialized." << std::endl;
-    }
-
-    static void set_handlers(SafeHandlerMap* handlers)
-    {
-        handlers_ = handlers;
-    }
-
-    static void set_thread_pool(ThreadPool* pool)
-    {
-        thread_pool = pool;
+       LOG_INFO("WorkerReactor %d initialized.", id_);
     }
 
     void AddConnection(evutil_socket_t fd)
@@ -159,7 +152,7 @@ public:
     }
 
 private:
-    static void notify_callback(evutil_socket_t fd, short events, void* arg)
+    static void notify_callback(evutil_socket_t fd, short /*events*/, void* arg)
     {
         WorkerReactor* reactor = static_cast<WorkerReactor*>(arg);
         char buf[1];
@@ -191,7 +184,7 @@ private:
         }
 
 
-        RpcSession* session = new RpcSession(bev);
+        RpcSession* session = new RpcSession(bev, thread_pool_, handlers_);
         session->send_ev_ = event_new(base, -1, EV_WRITE | EV_PERSIST, RpcSession::SendEventCallback, session);
         event_add(session->send_ev_, nullptr);
         bufferevent_setcb(bev, 
@@ -207,7 +200,7 @@ private:
    
 
     static void server_read_callback(struct bufferevent* bev, void* ctx)
-    {   
+    {
         struct FrameHeader header;
         struct evbuffer* input = bufferevent_get_input(bev);
 
@@ -216,53 +209,43 @@ private:
         {
             char header_buf[FrameHeader::header_size];
             evbuffer_copyout(input, header_buf, FrameHeader::header_size);
-            if(!DecodeHeader(header_buf, header))
+            if(!DecodeHeader(std::string(header_buf, FrameHeader::header_size), header))
             {
-                // 解析失败，关闭连接
                 bufferevent_free(bev);
                 return;
             }
 
-            // 这里可以根据 header.body_length 判断是否有完整的请求体数据
             if(evbuffer_get_length(input) >= FrameHeader::header_size + header.body_length)
             {
-                // 
-                evbuffer_drain(input, FrameHeader::header_size); // 移除已解析的头部数据
+                evbuffer_drain(input, FrameHeader::header_size);
                 std::string body_buf;
                 body_buf.resize(header.body_length);
                 evbuffer_remove(input, body_buf.data(), header.body_length);
-                
 
-                // 解析请求体并提交任务到线程池
-                // ...
-                std::string* error = new std::string;
+                auto error = std::make_shared<std::string>();
                 DecodedFrame decoded;
-                if(!VerifyAndDecodeFrame(header, body_buf, decoded, CodecOptions(), error))
+                if(!VerifyAndDecodeFrame(header, body_buf, decoded, CodecOptions(), error.get()))
                 {
-                    // 解析失败，关闭连接
-                    std::cout << "Failed to decode frame: " << *error << std::endl;
-                    delete error;
+                    LOG_ERROR("Failed to decode frame: %s", error->c_str());
                     bufferevent_free(bev);
                     return;
                 }
                 else
-                {   
+                {
                     if(decoded.type == MessageType::Heartbeat)
                     {
-                        // 处理心跳，可以直接回复一个心跳响应
                         RpcResponse heartbeat_response;
                         heartbeat_response.request_id = decoded.request.request_id;
-                        heartbeat_response.status_code = 0; // 成功
+                        heartbeat_response.status_code = 0;
                         std::string frame;
                         CodecOptions options;
-                        if(EncodeResponse(heartbeat_response, options, frame, error))
+                        if(EncodeResponse(heartbeat_response, options, frame, error.get()))
                         {
                             session->SendResponse(frame);
                         }
                         else
                         {
-                            std::cout << "Failed to encode heartbeat response: " << *error << std::endl;
-                            delete error;
+                            LOG_ERROR("Failed to encode heartbeat response: %s", error->c_str());
                             bufferevent_free(bev);
                             return;
                         }
@@ -271,74 +254,71 @@ private:
                     {
                         std::string key = decoded.request.service + "#" + decoded.request.method;
                         Handler handler;
-                        if(!handlers_->Get(key, handler))
+                        if(!session->handlers_->Get(key, handler))
                         {
-                            // 没有找到对应的处理函数，可以构造一个错误响应并发送回客户端
                             RpcResponse error_response;
                             error_response.request_id = decoded.request.request_id;
-                            error_response.status_code = -1; // 错误
+                            error_response.status_code = -1;
                             error_response.error_message = "No handler found for " + key;
                             std::string frame;
                             CodecOptions options;
-                            if(EncodeResponse(error_response, options, frame, error))
+                            if(EncodeResponse(error_response, options, frame, error.get()))
                             {
                                 session->SendResponse(frame);
                                 return;
                             }
                             else
                             {
-                                std::cout << "Failed to encode error response: " << *error << std::endl;
-                                delete error;
+                                LOG_ERROR("Failed to encode error response: %s", error->c_str());
                                 bufferevent_free(bev);
                                 return;
                             }
                         }
 
-                        RpcResponse* response = new RpcResponse; // 你需要根据实际情况构造响应对象
-                         thread_pool->submit([response,handler,session,error,decoded]()->bool{
-                                handler(decoded.request, *response, error);
+                        auto response = std::make_shared<RpcResponse>();
+                        auto frame_received_time = std::chrono::steady_clock::now();
+                         session->thread_pool_->submit([response, handler, session, error, decoded, frame_received_time]()->bool{
+                                handler(decoded.request, *response, error.get());
+
+                                auto handler_done = std::chrono::steady_clock::now();
+                                int64_t latency_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                    handler_done - frame_received_time).count();
+                                MetricsCollector::Instance().RecordServerLatencyUs(latency_us);
+
                                 std::string frame;
                                 CodecOptions options;
-                                if(EncodeResponse(*response, options, frame, error))
-                                {                                   
+                                if(EncodeResponse(*response, options, frame, error.get()))
+                                {
                                      session->SendResponse(frame);
                                 }
                                 else
                                 {
-                                    std::cout << "Failed to encode response: " << *error << std::endl;
-                                    delete error;
+                                    LOG_ERROR("Failed to encode response: %s", error->c_str());
                                     return false;
                                 }
-                                delete response;
-                                delete error;
                         return true;
                     });
                     }
-                    
+
                 }
             }
         }
 
         return;
-
-            // 这里是处理读事件的回调函数
-            // 你可以从 bev 中读取数据，解析请求，并提交任务到线程池
     }
 
 
     static void server_event_callback(struct bufferevent *bev, short events, void *ctx) {
-        if (events & BEV_EVENT_ERROR) {
-            
-        }
-        if (events & BEV_EVENT_EOF) {
-         
-        }
-         if (events & BEV_EVENT_CONNECTED) {
-      
-        }
-    
+        RpcSession* session = static_cast<RpcSession*>(ctx);
         if (events & (BEV_EVENT_ERROR | BEV_EVENT_EOF)) {
-        bufferevent_free(bev);
+            if (session) {
+                if (session->send_ev_) {
+                    event_free(session->send_ev_);
+                    session->send_ev_ = nullptr;
+                }
+                delete session;
+            }
+            bufferevent_free(bev);
         }
     }
 
@@ -360,7 +340,7 @@ private:
     bool is_running = false;
 
 public:
-    MainReactor(short port,ThreadPool* pool,SafeHandlerMap* handlers,const std::string& ip = "127.0.0.1",int workers_num = 8):port_(port),ip_(ip),worker_threads_(workers_num){
+    MainReactor(short port,ThreadPool* pool,SafeHandlerMap* handlers,const std::string& ip = "127.0.0.1",int workers_num = 8):worker_threads_(workers_num), port_(port), ip_(ip) {
 
         struct sockaddr_in sin;
         memset(&sin, 0, sizeof(sin));
@@ -378,21 +358,18 @@ public:
         if (!listener) {
             
             event_base_free(base);
-            std::cerr << "Listener failed: " << strerror(errno) << std::endl;
+            LOG_ERROR("Listener failed: %s", strerror(errno));
             base = nullptr;
             return;
         }
         
-        std::cout << "MainReactor initialized on " << ip_ << ":" << port_ << " with " << worker_threads_ << " worker threads." << std::endl;
-
-        WorkerReactor::set_thread_pool(pool);
-        WorkerReactor::set_handlers(handlers);
+        LOG_INFO("MainReactor initialized on %s:%d with %d worker threads.", ip_.c_str(), port_, worker_threads_);
 
          for(int i = 0; i < worker_threads_; i++)
         {
             struct event_base* worker_base = event_base_new();
             worker_bases.push_back(worker_base);
-            worker_reactors.push_back(std::make_unique<WorkerReactor>(worker_base, i));
+            worker_reactors.push_back(std::make_unique<WorkerReactor>(worker_base, pool, handlers, i));
         }
     };
 
@@ -446,7 +423,9 @@ public:
 class RPCServer
 {
 public:
-    RPCServer(short port,const std::string& ip = "127.0.0.1"):thread_pool(new ThreadPool(8)),main_reactor(new MainReactor(port,thread_pool,&handlers,ip,8)){
+    RPCServer(short port, const std::string& ip = "127.0.0.1", int workers_num = 4)
+        : thread_pool(new ThreadPool(workers_num))
+        , main_reactor(new MainReactor(port, thread_pool, &handlers, ip, workers_num)) {
     };
     ~RPCServer()
     {
@@ -467,16 +446,39 @@ public:
     }
 
     template<typename RequestType, typename ResponseType>
-    void register_typedhandler(const RequestType& req, const ResponseType& resp, const std::string& service,const std::string& method,std::function<bool(const RequestType&, const ResponseType&, std::string error)> handler)
+    void register_typedhandler(const std::string& service, const std::string& method,
+        std::function<bool(const RequestType&, ResponseType&, std::string* error)> handler)
     {
-        static_assert(std::is_base_of<google::protobuf::Message, RequestType>::value, "RequestType must be a protobuf message");
-        static_assert(std::is_base_of<google::protobuf::Message, ResponseType>::value, "ResponseType must be a protobuf message");
+        static_assert(std::is_base_of<google::protobuf::Message, RequestType>::value,
+                      "RequestType must be a protobuf message");
+        static_assert(std::is_base_of<google::protobuf::Message, ResponseType>::value,
+                      "ResponseType must be a protobuf message");
 
+        Handler wrapper = [handler](const RpcRequest& rpc_req, RpcResponse& rpc_resp,
+                                     std::string* error) -> bool {
+            RequestType req;
+            ResponseType resp;
 
-        //处理完RequestType ResponseType后，调用handler，并将结果转换为RpcRequest和RpcResponse传递给通用handler
-        Handler wrapper = [handler](const RpcRequest& rpc_req, const RpcResponse& rpc_resp, std::string error) -> bool {
+            if (!DeserializeMessage(rpc_req.payload, rpc_req.serialization, req, error)) {
+                rpc_resp.status_code = -1;
+                rpc_resp.error_message = "deserialize failed: " + *error;
+                return false;
+            }
 
-            //处理
+            if (!handler(req, resp, error)) {
+                if (rpc_resp.status_code == 0) rpc_resp.status_code = -1;
+                return false;
+            }
+
+            if (!SerializeMessage(resp, rpc_req.serialization, rpc_resp.payload, error)) {
+                rpc_resp.status_code = -1;
+                rpc_resp.error_message = "serialize failed: " + *error;
+                return false;
+            }
+
+            rpc_resp.request_id = rpc_req.request_id;
+            rpc_resp.status_code = 0;
+            rpc_resp.serialization = rpc_req.serialization;
             return true;
         };
 

@@ -57,59 +57,66 @@ include_directories(
 )
 
 # 源文件
-set(SOURCE_FILES
+set(COMMON_SOURCES
     coder.cpp
     serialzation.cpp
     log.cpp
-    main.cpp
     protocol.cpp
     safe_queue.cpp
     thread_pool.cpp
     rpcserver.cpp
+    rpcclient.cpp
     person.pb.cc
     compresser.cpp
     crypto.cpp
 )
 
-# 创建可执行文件
-add_executable(RPCServer ${SOURCE_FILES})
-
-# ========== 关键修改 4：用目标方式链接，自动传递所有依赖 ==========
-target_link_libraries(RPCServer
-    protobuf::libprotobuf
-    ${LIBEVENT_LIBRARIES}
-    ${LIBEVENT_PTHREADS_LIBRARIES}
-    absl::strings
-    absl::any
-    absl::log
-    absl::hash
-    absl::status
-    ZLIB::ZLIB
-    # ===== 新增：OpenSSL 链接 =====
-    OpenSSL::SSL
-    OpenSSL::Crypto
-    pthread
+set(DEMO_SOURCES
+    main.cpp
 )
 
-# ===== 新增 3：若找到 zstd，链接库并定义宏 =====
-if(zstd_FOUND)
-    # 如果通过 pkg_check_modules(IMPORTED_TARGET) 获得目标，名为 PkgConfig::zstd
-    # 如果通过 find_package(zstd CONFIG) 获得目标，通常为 zstd::libzstd
-    # 为了兼容两种方式，先判断是否存在目标
-    if(TARGET PkgConfig::zstd)
-        target_link_libraries(RPCServer PkgConfig::zstd)
-    elseif(TARGET zstd::libzstd)
-        target_link_libraries(RPCServer zstd::libzstd)
-    else()
-        # 如果只有变量，用传统方式（可能性很低）
-        target_link_libraries(RPCServer ${zstd_LIBRARIES})
-        target_include_directories(RPCServer PRIVATE ${zstd_INCLUDE_DIRS})
+set(BENCH_SOURCES
+    bench.cpp
+)
+
+# 创建可执行文件
+add_executable(RPCServer ${COMMON_SOURCES} ${DEMO_SOURCES})
+add_executable(Benchmark ${COMMON_SOURCES} ${BENCH_SOURCES})
+
+# ========== 关键修改 4：用目标方式链接，自动传递所有依赖 ==========
+function(link_common_libs TARGET_NAME)
+    target_link_libraries(${TARGET_NAME}
+        protobuf::libprotobuf
+        ${LIBEVENT_LIBRARIES}
+        ${LIBEVENT_PTHREADS_LIBRARIES}
+        absl::strings
+        absl::any
+        absl::log
+        absl::hash
+        absl::status
+        ZLIB::ZLIB
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        pthread
+    )
+    if(zstd_FOUND)
+        if(TARGET PkgConfig::zstd)
+            target_link_libraries(${TARGET_NAME} PkgConfig::zstd)
+        elseif(TARGET zstd::libzstd)
+            target_link_libraries(${TARGET_NAME} zstd::libzstd)
+        else()
+            target_link_libraries(${TARGET_NAME} ${zstd_LIBRARIES})
+            target_include_directories(${TARGET_NAME} PRIVATE ${zstd_INCLUDE_DIRS})
+        endif()
+        target_compile_definitions(${TARGET_NAME} PRIVATE HAS_ZSTD)
     endif()
-    target_compile_definitions(RPCServer PRIVATE HAS_ZSTD)
-endif()
+endfunction()
+
+link_common_libs(RPCServer)
+link_common_libs(Benchmark)
 
 # 设置输出目录
-set_target_properties(RPCServer PROPERTIES
+set_target_properties(RPCServer Benchmark PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_CURRENT_SOURCE_DIR}/bin/x64/Debug
     RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_CURRENT_SOURCE_DIR}/bin/x64/Release
 )

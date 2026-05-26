@@ -198,8 +198,8 @@ bool EncodeResponse(const RpcResponse &response, const CodecOptions &options, st
 
 
     std::string body;
-    WriteUint16(body,response.error_message.size());
-    WriteInt32(body,response.status_code);
+    WriteInt32(body, response.status_code);
+    WriteUint16(body, response.error_message.size());
     body.append(response.error_message);
     body.append(response.payload);
 
